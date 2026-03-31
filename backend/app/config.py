@@ -69,6 +69,13 @@ class Config:
     REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))
     REPORT_AGENT_TEMPERATURE = float(os.environ.get('REPORT_AGENT_TEMPERATURE', '0.5'))
 
+    # Batch & parallelism optimization
+    NER_BATCH_SIZE = int(os.environ.get('NER_BATCH_SIZE', '12'))
+    NER_PARALLEL_BATCHES = int(os.environ.get('NER_PARALLEL_BATCHES', '2'))
+    REPORT_PARALLEL_SECTIONS = int(os.environ.get('REPORT_PARALLEL_SECTIONS', '2'))
+    LLM_CACHE_ENABLED = os.environ.get('LLM_CACHE_ENABLED', 'false').lower() == 'true'
+    LLM_CACHE_SIZE = int(os.environ.get('LLM_CACHE_SIZE', '200'))
+
     @classmethod
     def validate(cls):
         """Validate required configuration"""

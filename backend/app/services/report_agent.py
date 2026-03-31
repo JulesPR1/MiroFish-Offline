@@ -13,6 +13,8 @@ import os
 import json
 import time
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -52,6 +54,7 @@ class ReportLogger:
             Config.UPLOAD_FOLDER, 'reports', report_id, 'agent_log.jsonl'
         )
         self.start_time = datetime.now()
+        self._lock = threading.Lock()
         self._ensure_log_file()
     
     def _ensure_log_file(self):
@@ -92,9 +95,10 @@ class ReportLogger:
             "details": details
         }
         
-        # Append to JSONL file
-        with open(self.log_file_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        # Append to JSONL file (thread-safe)
+        with self._lock:
+            with open(self.log_file_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
     
     def log_start(self, simulation_id: str, graph_id: str, simulation_requirement: str):
         """Log report generation start"""
@@ -960,7 +964,7 @@ class ReportAgent:
             }
         }
     
-    def _execute_tool(self, tool_name: str, parameters: Dict[str, Any], report_context: str = "") -> str:
+    def _execute_tool(self, tool_name: str, parameters: Dict[str, Any], report_context: str = "", section_title: str = "") -> str:
         """
         Execute tool call
 
@@ -978,11 +982,16 @@ class ReportAgent:
             if tool_name == "insight_forge":
                 query = parameters.get("query", "")
                 ctx = parameters.get("report_context", "") or report_context
+                # Use pre-generated sub-queries if available (consumed on first use per section)
+                pre_queries = None
+                if hasattr(self, '_pregenerated_sub_queries') and self._pregenerated_sub_queries and section_title:
+                    pre_queries = self._pregenerated_sub_queries.pop(section_title, None)
                 result = self.graph_tools.insight_forge(
                     graph_id=self.graph_id,
                     query=query,
                     simulation_requirement=self.simulation_requirement,
-                    report_context=ctx
+                    report_context=ctx,
+                    pre_generated_queries=pre_queries,
                 )
                 return result.to_text()
             
@@ -1440,7 +1449,8 @@ class ReportAgent:
                 result = self._execute_tool(
                     call["name"],
                     call.get("parameters", {}),
-                    report_context=report_context
+                    report_context=report_context,
+                    section_title=section.title,
                 )
 
                 if self.report_logger:
@@ -1621,7 +1631,14 @@ class ReportAgent:
                     progress_callback(stage, prog // 5, msg) if progress_callback else None
             )
             report.outline = outline
-            
+
+            # Pre-generate InsightForge sub-queries for all sections in ONE LLM call
+            section_titles = [s.title for s in outline.sections]
+            self._pregenerated_sub_queries = self.graph_tools.pre_generate_all_section_queries(
+                section_titles=section_titles,
+                simulation_requirement=self.simulation_requirement,
+            )
+
             # recordplancompletion log
             self.report_logger.log_planning_complete(outline.to_dict())
             
@@ -1635,72 +1652,90 @@ class ReportAgent:
             
             logger.info(f"outlinesavedtofile: {report_id}/outline.json")
             
-            # Phase 2: Sequentially generate sectionsgeneration (per sectionsave）
+            # Phase 2: Generate sections (section 0 sequential, rest parallel)
             report.status = ReportStatus.GENERATING
-            
+
             total_sections = len(outline.sections)
-            generated_sections = []  # savecontentfor context
-            
-            for i, section in enumerate(outline.sections):
-                section_num = i + 1
-                base_progress = 20 + int((i / total_sections) * 70)
-                
-                # Update progress
-                ReportManager.update_progress(
-                    report_id, "generating", base_progress,
-                    f"generatinggenerateSection: {section.title} ({section_num}/{total_sections})",
-                    current_section=section.title,
-                    completed_sections=completed_section_titles
-                )
-                
+            parallel_sections = Config.REPORT_PARALLEL_SECTIONS
+
+            def _generate_and_save(section_idx: int, section, anchor_context: List[str]):
+                """Generate one section and save it. Safe to call from a thread."""
+                section_num = section_idx + 1
+                base_progress = 20 + int((section_idx / total_sections) * 70)
+
                 if progress_callback:
                     progress_callback(
-                        "generating", 
-                        base_progress, 
-                        f"generatinggenerateSection: {section.title} ({section_num}/{total_sections})"
+                        "generating",
+                        base_progress,
+                        f"Generating section: {section.title} ({section_num}/{total_sections})"
                     )
-                
-                # Generate main sectioncontent
-                section_content = self._generate_section_react(
+
+                content = self._generate_section_react(
                     section=section,
                     outline=outline,
-                    previous_sections=generated_sections,
+                    previous_sections=anchor_context,
                     progress_callback=lambda stage, prog, msg:
                         progress_callback(
-                            stage, 
+                            stage,
                             base_progress + int(prog * 0.7 / total_sections),
                             msg
                         ) if progress_callback else None,
                     section_index=section_num
                 )
-                
-                section.content = section_content
-                generated_sections.append(f"## {section.title}\n\n{section_content}")
 
-                # saveSection
+                section.content = content
                 ReportManager.save_section(report_id, section_num, section)
-                completed_section_titles.append(section.title)
 
-                # Log sectioncompletion log
-                full_section_content = f"## {section.title}\n\n{section_content}"
-
+                full_content = f"## {section.title}\n\n{content}"
                 if self.report_logger:
                     self.report_logger.log_section_full_complete(
                         section_title=section.title,
                         section_index=section_num,
-                        full_content=full_section_content.strip()
+                        full_content=full_content.strip()
                     )
 
-                logger.info(f"Sectionsaved: {report_id}/section_{section_num:02d}.md")
-                
-                # Update progress
+                logger.info(f"Section saved: {report_id}/section_{section_num:02d}.md")
+
                 ReportManager.update_progress(
-                    report_id, "generating", 
+                    report_id, "generating",
                     base_progress + int(70 / total_sections),
                     f"Section {section.title} completed",
                     current_section=None,
                     completed_sections=completed_section_titles
                 )
+                return content
+
+            # --- Section 0: always runs first to establish context ---
+            section_0 = outline.sections[0]
+            ReportManager.update_progress(
+                report_id, "generating", 20,
+                f"Generating section: {section_0.title} (1/{total_sections})",
+                current_section=section_0.title,
+                completed_sections=completed_section_titles
+            )
+            s0_content = _generate_and_save(0, section_0, [])
+            completed_section_titles.append(section_0.title)
+
+            # Anchor context: first section truncated (shared read-only across parallel workers)
+            anchor_context = [f"## {section_0.title}\n\n{s0_content[:2000]}"]
+
+            # --- Sections 1+: parallel ---
+            remaining = list(enumerate(outline.sections[1:], start=1))
+            if remaining:
+                workers = min(parallel_sections, len(remaining))
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_to_idx = {
+                        executor.submit(_generate_and_save, idx, sec, anchor_context): idx
+                        for idx, sec in remaining
+                    }
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        try:
+                            future.result()
+                            completed_section_titles.append(outline.sections[idx].title)
+                        except Exception as sec_err:
+                            logger.error(f"Section {idx + 1} generation failed: {sec_err}")
+                            raise
             
             # phase3: assembleComplete report
             if progress_callback:

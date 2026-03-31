@@ -6,6 +6,7 @@ Uses GraphStorage (Neo4j) to replace Zep Cloud API.
 import time
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass
 
@@ -43,6 +44,7 @@ class GraphBuilderService:
     def __init__(self, storage: GraphStorage):
         self.storage = storage
         self.task_manager = TaskManager()
+        self._parallel_batches = Config.NER_PARALLEL_BATCHES
 
     def build_graph_async(
         self,
@@ -51,7 +53,7 @@ class GraphBuilderService:
         graph_name: str = "MiroFish Graph",
         chunk_size: int = 500,
         chunk_overlap: int = 50,
-        batch_size: int = 3
+        batch_size: int = None
     ) -> str:
         """
         Build graph asynchronously
@@ -62,11 +64,14 @@ class GraphBuilderService:
             graph_name: Name for the graph
             chunk_size: Text chunk size
             chunk_overlap: Chunk overlap size
-            batch_size: Number of chunks to send per batch
+            batch_size: Chunks per NER LLM call (defaults to Config.NER_BATCH_SIZE)
 
         Returns:
             Task ID
         """
+        if batch_size is None:
+            batch_size = Config.NER_BATCH_SIZE
+
         # Create task
         task_id = self.task_manager.create_task(
             task_type="graph_build",
@@ -182,57 +187,89 @@ class GraphBuilderService:
         """
         self.storage.set_ontology(graph_id, ontology)
 
+    def _process_one_batch(
+        self,
+        graph_id: str,
+        batch_chunks: List[str],
+        batch_num: int,
+        total_batches: int,
+    ) -> List[str]:
+        """Process a single NER batch. Safe to call from multiple threads."""
+        t0 = time.time()
+        ids = self.storage.add_text_batch(
+            graph_id,
+            batch_chunks,
+            batch_size=len(batch_chunks),
+        )
+        elapsed = time.time() - t0
+        logger.info(
+            f"[graph_build] Batch {batch_num}/{total_batches} "
+            f"({len(batch_chunks)} chunks, {len(ids)} episodes) done in {elapsed:.1f}s"
+        )
+        return ids
+
     def add_text_batches(
         self,
         graph_id: str,
         chunks: List[str],
-        batch_size: int = 3,
+        batch_size: int = None,
         progress_callback: Optional[Callable] = None
     ) -> List[str]:
-        """Add text in batches to graph, return uuid list of all episodes"""
-        episode_uuids = []
+        """
+        Add text to graph using batched NER extraction + optional parallelism.
+
+        batch_size controls how many chunks go into a single NER LLM call.
+        NER_PARALLEL_BATCHES controls how many batches are submitted concurrently.
+        """
+        if batch_size is None:
+            batch_size = Config.NER_BATCH_SIZE
+
         total_chunks = len(chunks)
-        total_batches = (total_chunks + batch_size - 1) // batch_size
+        batches = [chunks[i:i + batch_size] for i in range(0, total_chunks, batch_size)]
+        total_batches = len(batches)
 
-        logger.info(f"[graph_build] Starting: {total_chunks} chunks, {total_batches} batches (batch_size={batch_size})")
+        logger.info(
+            f"[graph_build] Starting: {total_chunks} chunks → {total_batches} NER batches "
+            f"(batch_size={batch_size}, parallel={self._parallel_batches})"
+        )
 
-        for i in range(0, total_chunks, batch_size):
-            batch_chunks = chunks[i:i + batch_size]
-            batch_num = i // batch_size + 1
+        results: Dict[int, List[str]] = {}
+        lock = threading.Lock()
+        completed = [0]
 
+        def _submit(batch_num: int, batch_chunks: List[str]) -> tuple:
+            ids = self._process_one_batch(graph_id, batch_chunks, batch_num, total_batches)
+            with lock:
+                completed[0] += 1
+                done = completed[0]
             if progress_callback:
-                progress = (i + len(batch_chunks)) / total_chunks
                 progress_callback(
-                    f"Processing batch {batch_num}/{total_batches} ({len(batch_chunks)} chunks)...",
-                    progress
+                    f"Processed batch {done}/{total_batches} ({len(batch_chunks)} chunks)...",
+                    done / total_batches,
                 )
+            return batch_num, ids
 
-            for j, chunk in enumerate(batch_chunks):
-                chunk_idx = i + j + 1
-                chunk_preview = chunk[:80].replace('\n', ' ')
-                logger.info(
-                    f"[graph_build] Chunk {chunk_idx}/{total_chunks} "
-                    f"({len(chunk)} chars): \"{chunk_preview}...\""
-                )
-                t0 = time.time()
-                try:
-                    episode_id = self.storage.add_text(graph_id, chunk)
-                    episode_uuids.append(episode_id)
-                    elapsed = time.time() - t0
-                    logger.info(
-                        f"[graph_build] Chunk {chunk_idx}/{total_chunks} done in {elapsed:.1f}s"
-                    )
-                except Exception as e:
-                    elapsed = time.time() - t0
-                    logger.error(
-                        f"[graph_build] Chunk {chunk_idx}/{total_chunks} FAILED "
-                        f"after {elapsed:.1f}s: {e}"
-                    )
-                    if progress_callback:
-                        progress_callback(f"Batch {batch_num} processing failed: {str(e)}", 0)
-                    raise
+        try:
+            with ThreadPoolExecutor(max_workers=self._parallel_batches) as executor:
+                futures = {
+                    executor.submit(_submit, batch_num, batch_chunks): batch_num
+                    for batch_num, batch_chunks in enumerate(batches, start=1)
+                }
+                for future in as_completed(futures):
+                    batch_num, ids = future.result()
+                    results[batch_num] = ids
+        except Exception as e:
+            logger.error(f"[graph_build] Batch processing FAILED: {e}")
+            if progress_callback:
+                progress_callback(f"Batch processing failed: {str(e)}", 0)
+            raise
 
-        logger.info(f"[graph_build] All {total_chunks} chunks processed successfully")
+        # Reassemble in original order
+        episode_uuids = []
+        for batch_num in sorted(results.keys()):
+            episode_uuids.extend(results[batch_num])
+
+        logger.info(f"[graph_build] All {total_chunks} chunks processed, {len(episode_uuids)} episodes created")
         return episode_uuids
 
     def _get_graph_info(self, graph_id: str) -> GraphInfo:

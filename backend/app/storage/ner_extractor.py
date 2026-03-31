@@ -117,7 +117,7 @@ class NERExtractor:
                 result = self.llm.chat_json(
                     messages=messages,
                     temperature=0.1,  # Low temp for extraction precision
-                    max_tokens=4096,
+                    max_tokens=16000,
                 )
                 return self._validate_and_clean(result, ontology)
 

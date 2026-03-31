@@ -8,12 +8,48 @@ import json
 import os
 import re
 import logging
+import threading
+from collections import OrderedDict
 from typing import Optional, Dict, Any, List
 from openai import OpenAI
 
 from ..config import Config
 
 logger = logging.getLogger('mirofish.llm')
+
+
+class _LRUCache:
+    """Thread-safe LRU cache for chat_json responses (structured outputs only)."""
+
+    def __init__(self, maxsize: int = 200):
+        self._cache: OrderedDict = OrderedDict()
+        self._maxsize = maxsize
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def _make_key(self, messages: List[Dict], temperature: float, max_tokens: int) -> tuple:
+        msg_tuple = tuple((m.get("role", ""), m.get("content", "")) for m in messages)
+        return (msg_tuple, temperature, max_tokens)
+
+    def get(self, messages: List[Dict], temperature: float, max_tokens: int) -> Optional[Dict]:
+        key = self._make_key(messages, temperature, max_tokens)
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self.hits += 1
+                return self._cache[key]
+            self.misses += 1
+            return None
+
+    def set(self, messages: List[Dict], temperature: float, max_tokens: int, value: Dict):
+        key = self._make_key(messages, temperature, max_tokens)
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = value
+            if len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
 
 
 class LLMClient:
@@ -43,6 +79,11 @@ class LLMClient:
         # Read from env OLLAMA_NUM_CTX, default 8192 (Ollama default is only 2048).
         self._num_ctx = int(os.environ.get('OLLAMA_NUM_CTX', '8192'))
 
+        # Optional LRU cache for chat_json (structured outputs only, disabled by default)
+        self._cache: Optional[_LRUCache] = (
+            _LRUCache(maxsize=Config.LLM_CACHE_SIZE) if Config.LLM_CACHE_ENABLED else None
+        )
+
     def _is_ollama(self) -> bool:
         """Check if we're talking to an Ollama server."""
         return '11434' in (self.base_url or '')
@@ -51,7 +92,7 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 4096,
+        max_tokens: int = 8132,
         response_format: Optional[Dict] = None
     ) -> str:
         """
@@ -121,6 +162,16 @@ class LLMClient:
         """
         try:
             logger.debug("Requesting JSON response from LLM...")
+
+            # Cache probe (only for chat_json — deterministic structured outputs)
+            if self._cache is not None:
+                cached = self._cache.get(messages, temperature, max_tokens)
+                if cached is not None:
+                    logger.debug(
+                        f"chat_json cache HIT (hits={self._cache.hits}, misses={self._cache.misses})"
+                    )
+                    return cached
+
             # Note: LM Studio doesn't support json_schema format, so we rely on prompt to guide JSON output
             response = self.chat(
                 messages=messages,
@@ -157,6 +208,9 @@ class LLMClient:
             try:
                 result = json.loads(cleaned_response)
                 logger.debug(f"JSON parsing successful, keys: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}")
+                # Store in cache on successful parse
+                if self._cache is not None:
+                    self._cache.set(messages, temperature, max_tokens, result)
                 return result
             except json.JSONDecodeError as e:
                 logger.error(f"JSON parsing failed: {str(e)}")

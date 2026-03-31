@@ -803,13 +803,64 @@ class GraphToolsService:
 
     # ========== Core Retrieval Tools (Optimized) ==========
 
+    def pre_generate_all_section_queries(
+        self,
+        section_titles: List[str],
+        simulation_requirement: str,
+        max_sub_queries: int = 5,
+    ) -> Dict[str, List[str]]:
+        """
+        Single LLM call to pre-generate sub-queries for all report section titles at once.
+        Returns a dict mapping section_title -> List[sub_query].
+        Falls back to empty dict on any error (callers fall back to per-call generation).
+        """
+        if not section_titles:
+            return {}
+
+        system_prompt = (
+            "You are a research decomposition expert. Given a list of report section titles "
+            "and a simulation context, decompose each title into specific sub-questions that "
+            "can be searched in a knowledge graph.\n\n"
+            "Return JSON format:\n"
+            '{"sections": [{"title": "<section title>", "sub_queries": ["q1", "q2", ...]}, ...]}'
+        )
+        user_prompt = (
+            f"Simulation context: {simulation_requirement}\n\n"
+            f"For each of the following {len(section_titles)} report sections, generate "
+            f"{max_sub_queries} focused sub-questions covering who, what, why, how, when, where:\n\n"
+            + json.dumps(section_titles, ensure_ascii=False, indent=2)
+            + "\n\nReturn JSON only."
+        )
+
+        try:
+            response = self.llm.chat_json(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=8132,
+            )
+            result: Dict[str, List[str]] = {}
+            for item in response.get("sections", []):
+                title = item.get("title", "")
+                queries = [str(q) for q in item.get("sub_queries", [])[:max_sub_queries]]
+                if title and queries:
+                    result[title] = queries
+            logger.info(f"Pre-generated sub-queries for {len(result)}/{len(section_titles)} sections")
+            return result
+        except Exception as e:
+            logger.warning(f"pre_generate_all_section_queries failed: {e} — falling back to per-call generation")
+            return {}
+
     def insight_forge(
         self,
         graph_id: str,
         query: str,
         simulation_requirement: str,
         report_context: str = "",
-        max_sub_queries: int = 5
+        max_sub_queries: int = 5,
+        pre_generated_queries: Optional[List[str]] = None,
     ) -> InsightForgeResult:
         """
         [InsightForge - Deep Insight Retrieval]
@@ -829,15 +880,19 @@ class GraphToolsService:
             sub_queries=[]
         )
 
-        # Step 1: Use LLM to generate sub-questions
-        sub_queries = self._generate_sub_queries(
-            query=query,
-            simulation_requirement=simulation_requirement,
-            report_context=report_context,
-            max_queries=max_sub_queries
-        )
+        # Step 1: Use pre-generated sub-queries if available, otherwise call LLM
+        if pre_generated_queries:
+            sub_queries = pre_generated_queries[:max_sub_queries]
+            logger.info(f"InsightForge: using {len(sub_queries)} pre-generated sub-queries (skipping LLM call)")
+        else:
+            sub_queries = self._generate_sub_queries(
+                query=query,
+                simulation_requirement=simulation_requirement,
+                report_context=report_context,
+                max_queries=max_sub_queries
+            )
+            logger.info(f"Generated {len(sub_queries)} sub-questions")
         result.sub_queries = sub_queries
-        logger.info(f"Generated {len(sub_queries)} sub-questions")
 
         # Step 2: Perform semantic search on each sub-question
         all_facts = []
@@ -1115,25 +1170,22 @@ Return the sub-questions as a JSON list."""
         result.total_agents = len(profiles)
         logger.info(f"Loaded {len(profiles)} Agent profiles")
 
-        # Step 2: Use LLM to select Agents for interview
-        selected_agents, selected_indices, selection_reasoning = self._select_agents_for_interview(
-            profiles=profiles,
-            interview_requirement=interview_requirement,
-            simulation_requirement=simulation_requirement,
-            max_agents=max_agents
-        )
+        # Step 2+3: Select agents AND generate questions in one LLM call
+        selected_agents, selected_indices, selection_reasoning, generated_questions = \
+            self._select_agents_and_generate_questions(
+                profiles=profiles,
+                interview_requirement=interview_requirement,
+                simulation_requirement=simulation_requirement,
+                max_agents=max_agents,
+            )
 
         result.selected_agents = selected_agents
         result.selection_reasoning = selection_reasoning
         logger.info(f"Selected {len(selected_agents)} Agents for interview: {selected_indices}")
 
-        # Step 3: Generate interview questions
+        # Use custom_questions if provided, otherwise use LLM-generated ones
         if not result.interview_questions:
-            result.interview_questions = self._generate_interview_questions(
-                interview_requirement=interview_requirement,
-                simulation_requirement=simulation_requirement,
-                selected_agents=selected_agents
-            )
+            result.interview_questions = generated_questions
             logger.info(f"Generated {len(result.interview_questions)} interview questions")
 
         combined_prompt = "\n".join([f"{i+1}. {q}" for i, q in enumerate(result.interview_questions)])
@@ -1321,6 +1373,79 @@ Return the sub-questions as a JSON list."""
                 logger.warning(f"Failed to read twitter_profiles.csv: {e}")
 
         return profiles
+
+    def _select_agents_and_generate_questions(
+        self,
+        profiles: List[Dict[str, Any]],
+        interview_requirement: str,
+        simulation_requirement: str,
+        max_agents: int,
+    ) -> tuple:
+        """
+        Single LLM call that selects agents AND generates interview questions.
+        Returns (selected_agents, valid_indices, reasoning, questions).
+        Falls back to defaults on error.
+        """
+        agent_summaries = [
+            {
+                "index": i,
+                "name": p.get("realname", p.get("username", f"Agent_{i}")),
+                "profession": p.get("profession", "Unknown"),
+                "bio": p.get("bio", "")[:200],
+                "interested_topics": p.get("interested_topics", []),
+            }
+            for i, p in enumerate(profiles)
+        ]
+
+        system_prompt = (
+            "You are a professional interview planning expert and journalist.\n"
+            "Given a list of Agent profiles and an interview requirement:\n"
+            "1. Select the most relevant agents (diverse perspectives: supporters, opposers, experts, etc.)\n"
+            "2. Generate 3-5 deep open-ended interview questions covering facts, viewpoints, and feelings\n\n"
+            "Return JSON format:\n"
+            '{"selected_indices": [list of integer indices], '
+            '"reasoning": "explanation", '
+            '"questions": ["question1", "question2", ...]}'
+        )
+        user_prompt = (
+            f"Interview Requirement: {interview_requirement}\n\n"
+            f"Simulation Background: {simulation_requirement or 'Not provided'}\n\n"
+            f"Available Agents ({len(agent_summaries)} total):\n"
+            + json.dumps(agent_summaries, ensure_ascii=False, indent=2)
+            + f"\n\nSelect up to {max_agents} agents and generate 3-5 interview questions."
+        )
+
+        try:
+            response = self.llm.chat_json(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+            )
+
+            selected_indices = response.get("selected_indices", [])[:max_agents]
+            reasoning = response.get("reasoning", "Selected based on relevance")
+            questions = response.get("questions", [f"What is your perspective on {interview_requirement}?"])
+
+            selected_agents = []
+            valid_indices = []
+            for idx in selected_indices:
+                if 0 <= idx < len(profiles):
+                    selected_agents.append(profiles[idx])
+                    valid_indices.append(idx)
+
+            return selected_agents, valid_indices, reasoning, questions
+
+        except Exception as e:
+            logger.warning(f"Combined agent selection+questions failed: {e} — using fallback")
+            selected = profiles[:max_agents]
+            indices = list(range(min(max_agents, len(profiles))))
+            return selected, indices, "Default selection", [
+                f"What is your perspective on {interview_requirement}?",
+                "What impact does this have on you or those you represent?",
+                "How do you think this issue should be solved or improved?",
+            ]
 
     def _select_agents_for_interview(
         self,
