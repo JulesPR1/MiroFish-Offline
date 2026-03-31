@@ -154,7 +154,9 @@ def generate_ontology():
             }
         }
     """
+    print("[GENERATE_ONTOLOGY] START", flush=True)
     try:
+        print("[GENERATE_ONTOLOGY] In try block", flush=True)
         logger.info("=== Starting ontology generation ===")
 
         # Get parameters
@@ -221,12 +223,27 @@ def generate_ontology():
 
         # Generate ontology
         logger.info("Calling LLM to generate ontology definition...")
-        generator = OntologyGenerator()
-        ontology = generator.generate(
-            document_texts=document_texts,
-            simulation_requirement=simulation_requirement,
-            additional_context=additional_context if additional_context else None
-        )
+        logger.info(f"Creating OntologyGenerator with {len(document_texts)} documents...")
+        print(f"DEBUG: Creating OntologyGenerator with {len(document_texts)} documents", flush=True)
+
+        try:
+            generator = OntologyGenerator()
+            logger.info("OntologyGenerator created successfully")
+            print(f"DEBUG: OntologyGenerator created, calling generate()...", flush=True)
+
+            ontology = generator.generate(
+                document_texts=document_texts,
+                simulation_requirement=simulation_requirement,
+                additional_context=additional_context if additional_context else None
+            )
+            logger.info("OntologyGenerator.generate() completed successfully")
+            print(f"DEBUG: Ontology generation completed", flush=True)
+        except Exception as e:
+            logger.error(f"OntologyGenerator failed: {str(e)}")
+            print(f"ERROR in OntologyGenerator: {str(e)}", flush=True)
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}", flush=True)
+            raise
 
         # Save ontology to project
         entity_count = len(ontology.get("entity_types", []))
@@ -241,7 +258,7 @@ def generate_ontology():
         project.status = ProjectStatus.ONTOLOGY_GENERATED
         ProjectManager.save_project(project)
         logger.info(f"=== Ontology generation completed === Project ID: {project.project_id}")
-        
+
         return jsonify({
             "success": True,
             "data": {
@@ -253,12 +270,18 @@ def generate_ontology():
                 "total_text_length": project.total_text_length
             }
         })
-        
+
     except Exception as e:
+        error_msg = str(e)
+        tb = traceback.format_exc()
+        print(f"[EXCEPTION] Ontology generation failed: {error_msg}", flush=True)
+        print(f"[TRACEBACK]\n{tb}", flush=True)
+        logger.error(f"Ontology generation failed: {error_msg}")
+        logger.error(f"Traceback:\n{tb}")
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": error_msg,
+            "traceback": tb
         }), 500
 
 

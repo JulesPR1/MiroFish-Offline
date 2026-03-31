@@ -4,8 +4,12 @@ Interface 1: Analyze text content and generate entity and relationship type defi
 """
 
 import json
+import traceback
 from typing import Dict, Any, List, Optional
 from ..utils.llm_client import LLMClient
+from ..utils.logger import get_logger
+
+logger = get_logger('mirofish.ontology')
 
 
 # System prompt for ontology generation
@@ -181,29 +185,43 @@ class OntologyGenerator:
         Returns:
             Ontology definition (entity_types, edge_types, etc.)
         """
-        # Build user message
-        user_message = self._build_user_message(
-            document_texts,
-            simulation_requirement,
-            additional_context
-        )
+        try:
+            logger.info(f"Starting ontology generation with {len(document_texts)} document(s)")
 
-        messages = [
-            {"role": "system", "content": ONTOLOGY_SYSTEM_PROMPT},
-            {"role": "user", "content": user_message}
-        ]
+            # Build user message
+            user_message = self._build_user_message(
+                document_texts,
+                simulation_requirement,
+                additional_context
+            )
+            logger.debug(f"User message prepared, length: {len(user_message)} characters")
 
-        # Call LLM
-        result = self.llm_client.chat_json(
-            messages=messages,
-            temperature=0.3,
-            max_tokens=4096
-        )
+            messages = [
+                {"role": "system", "content": ONTOLOGY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message}
+            ]
 
-        # Validate and post-process
-        result = self._validate_and_process(result)
+            # Call LLM
+            logger.info("Sending request to LLM for ontology generation...")
+            result = self.llm_client.chat_json(
+                messages=messages,
+                temperature=0.3,
+                max_tokens=16000  # Increased from 8192 to ensure full ontology JSON response
+            )
+            logger.info(f"LLM returned response, validating...")
 
-        return result
+            # Validate and post-process
+            result = self._validate_and_process(result)
+            logger.info(f"Ontology generation completed: {len(result.get('entity_types', []))} entity types, {len(result.get('edge_types', []))} edge types")
+
+            return result
+
+        except Exception as e:
+            error_msg = str(e)
+            tb = traceback.format_exc()
+            logger.error(f"Ontology generation failed: {error_msg}")
+            logger.error(f"Traceback:\n{tb}")
+            raise
 
     # Maximum text length for LLM (50,000 characters)
     MAX_TEXT_LENGTH_FOR_LLM = 50000

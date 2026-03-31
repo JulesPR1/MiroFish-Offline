@@ -1,0 +1,1 @@
+I want to know if president Macron will be re-elected in 2027.

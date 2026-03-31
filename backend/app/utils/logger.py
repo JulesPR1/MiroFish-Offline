@@ -74,11 +74,11 @@ def setup_logger(name: str = 'mirofish', level: int = logging.DEBUG) -> logging.
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(detailed_formatter)
 
-    # 2. Console handler - concise logs (INFO and above)
+    # 2. Console handler - detailed logs (DEBUG and above) for development
     # Ensure UTF-8 encoding on Windows to avoid Chinese character issues
     _ensure_utf8_stdout()
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(simple_formatter)
 
     # Add handlers

@@ -24,9 +24,9 @@ The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Ch
 | Original MiroFish | MiroFish-Offline |
 |---|---|
 | Chinese UI | **English UI** (1,000+ strings translated) |
-| Zep Cloud (graph memory) | **Neo4j Community Edition 5.15** |
-| DashScope / OpenAI API (LLM) | **Ollama** (qwen2.5, llama3, etc.) |
-| Zep Cloud embeddings | **nomic-embed-text** via Ollama |
+| Zep Cloud (graph memory) | **Neo4j Community Edition 5.18** |
+| DashScope / OpenAI API (LLM) | **LM Studio** (any local model) |
+| Zep Cloud embeddings | **nomic-embed-text** via LM Studio |
 | Cloud API keys required | **Zero cloud dependencies** |
 
 ## Workflow
@@ -47,22 +47,42 @@ The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Ch
 
 ### Prerequisites
 
-- Docker & Docker Compose (recommended), **or**
-- Python 3.11+, Node.js 18+, Neo4j 5.15+, Ollama
+- [LM Studio](https://lmstudio.ai/) installed and running with models loaded
+- Docker & Docker Compose (recommended), **or** Python 3.11+, Node.js 18+, Neo4j 5.18+, LM Studio
 
-### Option A: Docker (easiest)
+### Step 0: Start LM Studio
+
+1. Open LM Studio and download the models you want to use (e.g. `qwen3.5-35b-a3b`)
+2. Also load an embedding model: `nomic-embed-text` (search in LM Studio's model catalog)
+3. Go to **Local Server** tab → start the server on port `1234`
+4. Make sure both the chat model and the embedding model are loaded
+
+### Option A: Docker (recommended)
 
 ```bash
 git clone https://github.com/nikmcfly/MiroFish-Offline.git
 cd MiroFish-Offline
 cp .env.example .env
+# Edit .env: set LLM_MODEL_NAME to the model name shown in LM Studio
+```
 
-# Start all services (Neo4j, Ollama, MiroFish)
+If running on **Linux**, add the following to the `mirofish` service in `docker-compose.yml` so the container can reach your host:
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+Then uncomment the Docker-mode overrides in `.env`:
+```bash
+LLM_BASE_URL=http://host.docker.internal:1234/v1
+NEO4J_URI=bolt://neo4j:7687
+EMBEDDING_BASE_URL=http://host.docker.internal:1234
+OPENAI_API_BASE_URL=http://host.docker.internal:1234
+```
+
+Start the services (Neo4j + MiroFish backend/frontend):
+```bash
 docker compose up -d
-
-# Pull the required models into Ollama
-docker exec mirofish-ollama ollama pull qwen2.5:32b
-docker exec mirofish-ollama ollama pull nomic-embed-text
 ```
 
 Open `http://localhost:3000` — that's it.
@@ -75,23 +95,20 @@ Open `http://localhost:3000` — that's it.
 docker run -d --name neo4j \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH=neo4j/mirofish \
-  neo4j:5.15-community
+  neo4j:5.18-community
 ```
 
-**2. Start Ollama & pull models**
-
-```bash
-ollama serve &
-ollama pull qwen2.5:32b      # LLM (or qwen2.5:14b for less VRAM)
-ollama pull nomic-embed-text  # Embeddings (768d)
-```
-
-**3. Configure & run backend**
+**2. Configure**
 
 ```bash
 cp .env.example .env
-# Edit .env if your Neo4j/Ollama are on non-default ports
+# Edit .env: set LLM_MODEL_NAME to the exact model name shown in LM Studio
+# Default URLs (http://127.0.0.1:1234/v1) already point to LM Studio
+```
 
+**3. Run backend**
+
+```bash
 cd backend
 pip install -r requirements.txt
 python run.py
@@ -112,22 +129,22 @@ Open `http://localhost:3000`.
 All settings are in `.env` (copy from `.env.example`):
 
 ```bash
-# LLM — points to local Ollama (OpenAI-compatible API)
-LLM_API_KEY=ollama
-LLM_BASE_URL=http://localhost:11434/v1
-LLM_MODEL_NAME=qwen2.5:32b
+# LLM — points to LM Studio local server (OpenAI-compatible API)
+LLM_API_KEY=API_USELESS_TOKEN   # any non-empty value works for local servers
+LLM_BASE_URL=http://127.0.0.1:1234/v1
+LLM_MODEL_NAME=qwen3.5-35b-a3b  # must match the model name shown in LM Studio
 
 # Neo4j
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=mirofish
 
-# Embeddings
+# Embeddings — also served by LM Studio
 EMBEDDING_MODEL=nomic-embed-text
-EMBEDDING_BASE_URL=http://localhost:11434
+EMBEDDING_BASE_URL=http://127.0.0.1:1234
 ```
 
-Works with any OpenAI-compatible API — swap Ollama for Claude, GPT, or any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
+Works with any OpenAI-compatible API — swap LM Studio for Ollama (`http://localhost:11434/v1`), Claude, GPT, or any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
 
 ## Architecture
 
@@ -151,8 +168,8 @@ This fork introduces a clean abstraction layer between the application and the g
 │    ┌─────────▼─────────┐                │
 │    │   Neo4jStorage     │                │
 │    │  ┌───────────────┐ │                │
-│    │  │ EmbeddingService│ ← Ollama       │
-│    │  │ NERExtractor   │ ← Ollama LLM   │
+│    │  │ EmbeddingService│ ← LM Studio   │
+│    │  │ NERExtractor   │ ← LM Studio   │
 │    │  │ SearchService  │ ← Hybrid search │
 │    │  └───────────────┘ │                │
 │    └───────────────────┘                │
@@ -160,7 +177,7 @@ This fork introduces a clean abstraction layer between the application and the g
                │
         ┌──────▼──────┐
         │  Neo4j CE   │
-        │  5.15       │
+        │  5.18       │
         └─────────────┘
 ```
 
@@ -199,7 +216,7 @@ AGPL-3.0 — same as the original MiroFish project. See [LICENSE](./LICENSE).
 This is a modified fork of [MiroFish](https://github.com/666ghj/MiroFish) by [666ghj](https://github.com/666ghj), originally supported by [Shanda Group](https://www.shanda.com/). The simulation engine is powered by [OASIS](https://github.com/camel-ai/oasis) from the CAMEL-AI team.
 
 **Modifications in this fork:**
-- Backend migrated from Zep Cloud to local Neo4j CE 5.15 + Ollama
+- Backend migrated from Zep Cloud to local Neo4j CE 5.18 + LM Studio
 - Entire frontend translated from Chinese to English (20 files, 1,000+ strings)
 - All Zep references replaced with Neo4j across the UI
 - Rebranded to MiroFish Offline
