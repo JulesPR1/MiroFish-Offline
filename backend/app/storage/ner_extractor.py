@@ -42,6 +42,40 @@ _USER_PROMPT = """Extract entities and relations from the following text:
 
 {text}"""
 
+_BATCH_SYSTEM_PROMPT = """You are a Named Entity Recognition and Relation Extraction system.
+Given multiple text chunks and an ontology (entity types + relation types), extract all entities and relations from each chunk.
+
+ONTOLOGY:
+{ontology_description}
+
+RULES:
+1. Only extract entity types and relation types defined in the ontology.
+2. Normalize entity names: strip whitespace, use canonical form (e.g., "Jack Ma" not "ma jack").
+3. Each entity must have: name, type (from ontology), and optional attributes.
+4. Each relation must have: source entity name, target entity name, type (from ontology), and a fact sentence describing the relationship.
+5. If no entities or relations are found in a chunk, return empty lists for that chunk.
+6. Be precise — only extract what is explicitly stated or strongly implied in the text.
+
+Return ONLY valid JSON in this exact format:
+{{
+  "chunks": [
+    {{
+      "chunk_index": 0,
+      "entities": [
+        {{"name": "...", "type": "...", "attributes": {{"key": "value"}}}}
+      ],
+      "relations": [
+        {{"source": "...", "target": "...", "type": "...", "fact": "..."}}
+      ]
+    }},
+    ...
+  ]
+}}"""
+
+_BATCH_USER_PROMPT = """Extract entities and relations from each text chunk below.
+
+{text_with_chunks}"""
+
 
 class NERExtractor:
     """Extract entities and relations from text using local LLM."""
@@ -102,6 +136,57 @@ class NERExtractor:
             f"NER extraction failed after {self.max_retries + 1} attempts: {last_error}"
         )
         return {"entities": [], "relations": []}
+
+    def extract_batch(self, texts: List[str], ontology: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Extract entities and relations from multiple text chunks in one LLM call.
+
+        Args:
+            texts: List of text chunks
+            ontology: Ontology definition
+
+        Returns:
+            List of extraction results, one per input text
+        """
+        if not texts or all(not t or not t.strip() for t in texts):
+            return [{"entities": [], "relations": []} for _ in texts]
+
+        # Format chunks with clear separators
+        text_with_chunks = ""
+        for i, text in enumerate(texts):
+            if text and text.strip():
+                text_with_chunks += f"\n\n===== CHUNK {i + 1} =====\n{text.strip()}"
+
+        if not text_with_chunks.strip():
+            return [{"entities": [], "relations": []} for _ in texts]
+
+        ontology_desc = self._format_ontology(ontology)
+        system_msg = _BATCH_SYSTEM_PROMPT.format(ontology_description=ontology_desc)
+        user_msg = _BATCH_USER_PROMPT.format(text_with_chunks=text_with_chunks)
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                result = self.llm.chat_json(
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=16384,
+                )
+                return self._parse_batch_result(result, texts, ontology)
+
+            except ValueError as e:
+                last_error = e
+            except Exception as e:
+                last_error = e
+                if attempt >= self.max_retries:
+                    break
+
+        return [{"entities": [], "relations": []} for _ in texts]
 
     def _format_ontology(self, ontology: Dict[str, Any]) -> str:
         """Format ontology dict into readable text for the LLM prompt."""
@@ -240,3 +325,28 @@ class NERExtractor:
             "entities": cleaned_entities,
             "relations": cleaned_relations,
         }
+
+    def _parse_batch_result(
+        self, result: Dict[str, Any], texts: List[str], ontology: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Parse batch extraction result into per-chunk results."""
+        chunks = result.get("chunks", [])
+
+        if not chunks:
+            return [{"entities": [], "relations": []} for _ in texts]
+
+        per_chunk_results = []
+        for i, text in enumerate(texts):
+            chunk_result = None
+            for c in chunks:
+                if c.get("chunk_index") == i:
+                    chunk_result = c
+                    break
+
+            if chunk_result:
+                cleaned = self._validate_and_clean(chunk_result, ontology)
+                per_chunk_results.append(cleaned)
+            else:
+                per_chunk_results.append({"entities": [], "relations": []})
+
+        return per_chunk_results

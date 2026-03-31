@@ -356,23 +356,203 @@ class Neo4jStorage(GraphStorage):
         batch_size: int = 3,
         progress_callback: Optional[Callable] = None,
     ) -> List[str]:
-        """Batch-add text chunks with progress reporting."""
+        """Batch-add text chunks with NER batch optimization."""
         episode_ids = []
         total = len(chunks)
+        ontology = self.get_ontology(graph_id)
+        now = datetime.now(timezone.utc).isoformat()
 
-        for i, chunk in enumerate(chunks):
-            if not chunk or not chunk.strip():
-                continue
-            episode_id = self.add_text(graph_id, chunk)
-            episode_ids.append(episode_id)
+        # Process chunks in NER batches
+        for batch_start in range(0, total, batch_size):
+            batch_end = min(batch_start + batch_size, total)
+            batch_chunks = chunks[batch_start:batch_end]
 
-            if progress_callback:
-                progress = (i + 1) / total
-                progress_callback(progress)
+            # Extract all chunks in batch with one LLM call
+            batch_extractions = self._ner.extract_batch(batch_chunks, ontology)
 
-            logger.info(f"Processed chunk {i + 1}/{total}")
+            # Create episodes for each chunk
+            for chunk_idx, (chunk, extraction) in enumerate(zip(batch_chunks, batch_extractions)):
+                if not chunk or not chunk.strip():
+                    continue
+
+                global_idx = batch_start + chunk_idx
+                episode_id = self._create_episode_from_extraction(
+                    graph_id, chunk, extraction, ontology, now
+                )
+                episode_ids.append(episode_id)
+
+                if progress_callback:
+                    progress = (global_idx + 1) / total
+                    progress_callback(f"Processed chunk {global_idx + 1}/{total}", progress)
 
         return episode_ids
+
+    def _create_episode_from_extraction(
+        self,
+        graph_id: str,
+        text: str,
+        extraction: Dict[str, Any],
+        ontology: Dict[str, Any],
+        now: str,
+    ) -> str:
+        """Create episode node and entities/relations from extraction."""
+        episode_id = str(uuid.uuid4())
+        entities = extraction.get("entities", [])
+        relations = extraction.get("relations", [])
+
+        # Batch embed
+        entity_summaries = [f"{e['name']} ({e['type']})" for e in entities]
+        fact_texts = [r.get("fact", f"{r['source']} {r['type']} {r['target']}") for r in relations]
+        all_texts_to_embed = entity_summaries + fact_texts
+
+        all_embeddings: list = []
+        if all_texts_to_embed:
+            try:
+                all_embeddings = self._embedding.embed_batch(all_texts_to_embed)
+            except Exception as e:
+                logger.warning(f"Batch embedding failed: {e}")
+                all_embeddings = [[] for _ in all_texts_to_embed]
+
+        entity_embeddings = all_embeddings[:len(entities)]
+        relation_embeddings = all_embeddings[len(entities):]
+
+        with self._driver.session() as session:
+            # Create episode node
+            def _create_episode(tx):
+                tx.run(
+                    """
+                    CREATE (ep:Episode {
+                        uuid: $uuid,
+                        graph_id: $graph_id,
+                        data: $data,
+                        processed: true,
+                        created_at: $created_at
+                    })
+                    """,
+                    uuid=episode_id,
+                    graph_id=graph_id,
+                    data=text,
+                    created_at=now,
+                )
+
+            self._call_with_retry(session.execute_write, _create_episode)
+
+            # MERGE entities
+            entity_uuid_map: Dict[str, str] = {}
+            for idx, entity in enumerate(entities):
+                ename = entity["name"]
+                etype = entity["type"]
+                attrs = entity.get("attributes", {})
+                summary_text = entity_summaries[idx]
+                embedding = entity_embeddings[idx] if idx < len(entity_embeddings) else []
+
+                e_uuid = str(uuid.uuid4())
+                entity_uuid_map[ename.lower()] = e_uuid
+
+                def _merge_entity(tx, _uuid=e_uuid, _name=ename, _type=etype,
+                                  _attrs=attrs, _embedding=embedding,
+                                  _summary=summary_text, _now=now):
+                    result = tx.run(
+                        """
+                        MERGE (n:Entity {graph_id: $gid, name_lower: $name_lower})
+                        ON CREATE SET
+                            n.uuid = $uuid,
+                            n.name = $name,
+                            n.summary = $summary,
+                            n.attributes_json = $attrs_json,
+                            n.embedding = $embedding,
+                            n.created_at = $now
+                        ON MATCH SET
+                            n.summary = CASE WHEN n.summary = '' OR n.summary IS NULL
+                                THEN $summary ELSE n.summary END,
+                            n.attributes_json = $attrs_json,
+                            n.embedding = $embedding
+                        RETURN n.uuid AS uuid
+                        """,
+                        gid=graph_id,
+                        name_lower=_name.lower(),
+                        uuid=_uuid,
+                        name=_name,
+                        summary=_summary,
+                        attrs_json=json.dumps(_attrs, ensure_ascii=False),
+                        embedding=_embedding,
+                        now=_now,
+                    )
+                    record = result.single()
+                    return record["uuid"] if record else _uuid
+
+                actual_uuid = self._call_with_retry(session.execute_write, _merge_entity)
+                entity_uuid_map[ename.lower()] = actual_uuid
+
+                # Add entity type label
+                if etype and etype != "Entity":
+                    try:
+                        def _add_label(tx, _name_lower=ename.lower()):
+                            tx.run(
+                                f"MATCH (n:Entity {{graph_id: $gid, name_lower: $nl}}) SET n:`{etype}`",
+                                gid=graph_id,
+                                nl=_name_lower,
+                            )
+                        self._call_with_retry(session.execute_write, _add_label)
+                    except Exception as e:
+                        logger.warning(f"Failed to add label '{etype}' to '{ename}': {e}")
+
+            # Create relations
+            for idx, relation in enumerate(relations):
+                source_name = relation["source"]
+                target_name = relation["target"]
+                rtype = relation["type"]
+                fact = relation["fact"]
+
+                source_uuid = entity_uuid_map.get(source_name.lower())
+                target_uuid = entity_uuid_map.get(target_name.lower())
+
+                if not source_uuid or not target_uuid:
+                    logger.warning(
+                        f"Skipping relation {source_name}->{target_name}: "
+                        f"entity not found in extraction results"
+                    )
+                    continue
+
+                fact_embedding = relation_embeddings[idx] if idx < len(relation_embeddings) else []
+                r_uuid = str(uuid.uuid4())
+
+                def _create_relation(tx, _r_uuid=r_uuid, _source_uuid=source_uuid,
+                                     _target_uuid=target_uuid, _rtype=rtype,
+                                     _fact=fact, _fact_emb=fact_embedding,
+                                     _episode_id=episode_id, _now=now):
+                    tx.run(
+                        """
+                        MATCH (src:Entity {uuid: $src_uuid})
+                        MATCH (tgt:Entity {uuid: $tgt_uuid})
+                        CREATE (src)-[r:RELATION {
+                            uuid: $uuid,
+                            graph_id: $gid,
+                            name: $name,
+                            fact: $fact,
+                            fact_embedding: $fact_embedding,
+                            attributes_json: '{}',
+                            episode_ids: [$episode_id],
+                            created_at: $now,
+                            valid_at: null,
+                            invalid_at: null,
+                            expired_at: null
+                        }]->(tgt)
+                        """,
+                        src_uuid=_source_uuid,
+                        tgt_uuid=_target_uuid,
+                        uuid=_r_uuid,
+                        gid=graph_id,
+                        name=_rtype,
+                        fact=_fact,
+                        fact_embedding=_fact_emb,
+                        episode_id=_episode_id,
+                        now=_now,
+                    )
+
+                self._call_with_retry(session.execute_write, _create_relation)
+
+        return episode_id
 
     def wait_for_processing(
         self,
